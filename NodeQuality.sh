@@ -37,6 +37,9 @@ LANG[en.ask_iq]="Run IPQuality test? (Enter for default 'y') [y/n]: "
 LANG[en.ask_nq]="Run NetQuality test? (Enter for default 'y', 'l' for low-data mode) [y/l/n]: "
 LANG[en.ask_bt]="Run Backroute Trace test? (Enter for default 'y') [y/n]: "
 LANG[en.cleanup_before]="Clean Up before Installation"
+LANG[en.install_dep]="Installing missing host dependencies:"
+LANG[en.install_dep_nopm]="Could not detect a supported package manager, please install manually:"
+LANG[en.install_dep_fail]="Failed to install required dependencies, please install manually:"
 LANG[en.loadbench]="Load BenchOs"
 LANG[en.basicinfo]="Hardware Info"
 LANG[en.run_hq]="Running Hardware Quality Test..."
@@ -55,6 +58,9 @@ LANG[cn.ask_iq]="运行 IPQuality 测试？（回车默认 'y'）[y/n]："
 LANG[cn.ask_nq]="运行 NetQuality 测试？（回车默认 'y'，'l' 为低流量模式）[y/l/n]："
 LANG[cn.ask_bt]="运行 回程路由追踪（Backroute Trace）测试？（回车默认 'y'）[y/n]："
 LANG[cn.cleanup_before]="安装前清理"
+LANG[cn.install_dep]="正在安装缺失的宿主机依赖："
+LANG[cn.install_dep_nopm]="未检测到受支持的包管理器，请手动安装："
+LANG[cn.install_dep_fail]="依赖安装失败，请手动安装："
 LANG[cn.loadbench]="加载 BenchOs"
 LANG[cn.basicinfo]="硬件信息"
 LANG[cn.run_hq]="正在运行硬件质量测试..."
@@ -201,6 +207,62 @@ function clear_mount(){
     umount -R $work_dir/BenchOs/dev/ 2> /dev/null
 }
 
+function detect_pkg_manager(){
+    if command -v apt-get >/dev/null 2>&1; then
+        echo apt
+    elif command -v dnf >/dev/null 2>&1; then
+        echo dnf
+    elif command -v yum >/dev/null 2>&1; then
+        echo yum
+    elif command -v pacman >/dev/null 2>&1; then
+        echo pacman
+    elif command -v zypper >/dev/null 2>&1; then
+        echo zypper
+    elif command -v apk >/dev/null 2>&1; then
+        echo apk
+    else
+        echo ""
+    fi
+}
+
+function pkg_install(){
+    # $@ = package names to install using the host package manager
+    case "$(detect_pkg_manager)" in
+        apt)    apt-get update -qq && apt-get install -y "$@" ;;
+        dnf)    dnf install -y "$@" ;;
+        yum)    yum install -y "$@" ;;
+        pacman) pacman -Sy --noconfirm --needed "$@" ;;
+        zypper) zypper --non-interactive install "$@" ;;
+        apk)    apk add "$@" ;;
+        *)      return 2 ;;
+    esac
+}
+
+function install_dependencies(){
+    # These host tools are required to download and run the BenchOS chroot.
+    # They ship by default on Debian/Ubuntu/CentOS, but a minimal install of
+    # some distros (e.g. Arch Linux base) may lack them, so install on demand.
+    declare -A cmd_pkg=( [curl]=curl [tar]=tar )
+    local missing_cmds=() missing_pkgs=() c
+    for c in "${!cmd_pkg[@]}"; do
+        if ! command -v "$c" >/dev/null 2>&1; then
+            missing_cmds+=("$c")
+            missing_pkgs+=("${cmd_pkg[$c]}")
+        fi
+    done
+    [[ ${#missing_pkgs[@]} -eq 0 ]] && return 0
+
+    _yellow_bold "$(L install_dep) ${missing_cmds[*]}"
+    if [[ -z "$(detect_pkg_manager)" ]]; then
+        _red "$(L install_dep_nopm) ${missing_cmds[*]}"
+        exit 1
+    fi
+    if ! pkg_install "${missing_pkgs[@]}"; then
+        _red "$(L install_dep_fail) ${missing_cmds[*]}"
+        exit 1
+    fi
+}
+
 function load_bench_os(){
     cd $work_dir
     rm -rf BenchOs
@@ -214,8 +276,16 @@ function load_bench_os(){
     mount --rbind /dev dev/
     mount --make-rslave dev
 
-    rm etc/resolv.conf 2>/dev/null
-    cp /etc/resolv.conf etc/resolv.conf
+    rm -f etc/resolv.conf 2>/dev/null
+    # Copy the host DNS config, dereferencing symlinks. On Arch Linux (and other
+    # systemd-resolved setups) /etc/resolv.conf is a symlink to a stub file, so a
+    # plain copy is unreliable; -L follows it to the real content.
+    cp -L /etc/resolv.conf etc/resolv.conf 2>/dev/null
+    # If the chroot ended up without any usable nameserver (dangling symlink or
+    # empty resolv.conf), fall back to public resolvers so in-chroot downloads work.
+    if ! grep -qE '^[[:space:]]*nameserver[[:space:]]+[0-9a-fA-F:.]+' etc/resolv.conf 2>/dev/null; then
+        printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > etc/resolv.conf
+    fi
 }
 
 function chroot_run(){
@@ -500,6 +570,7 @@ function main(){
     _green_bold "$(L cleanup_before)"
     pre_init
     pre_cleanup
+    install_dependencies
     _green_bold "$(L loadbench)"
     load_bench_os
 
